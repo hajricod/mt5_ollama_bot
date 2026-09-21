@@ -34,7 +34,9 @@ SESSION_END_HOUR_UTC = 20        # NY Session Mid-Close (20:00 UTC)
 
 # --- LEARNING / ADAPTIVE RISK STATE ---
 TRADE_HISTORY = []
+BAD_CONDITIONS = []
 MAX_TRADE_HISTORY = 200
+MAX_BAD_CONDITIONS = 25
 BASE_LOT_SIZE = DEFAULT_LOT_SIZE
 BASE_MAX_RISK_PERCENT = MAX_RISK_PERCENT
 
@@ -179,6 +181,31 @@ def adapt_risk_after_trade() -> None:
         MAX_RISK_PERCENT = min(BASE_MAX_RISK_PERCENT, max(MAX_RISK_PERCENT, BASE_MAX_RISK_PERCENT * 0.9))
 
 
+def save_trade_history(path: str = "trade_history.json") -> None:
+    """Persists recent trade history to disk for offline review and retraining."""
+    try:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(TRADE_HISTORY, file, indent=2, default=str)
+        print(f"   [LEARNING] Saved {len(TRADE_HISTORY)} trades to {path}")
+    except Exception as e:
+        print(f"   [LEARNING] Failed to save trade history: {e}")
+
+
+def add_bad_condition(condition: dict) -> None:
+    """Remembers a poor trading condition and blocks it in the future."""
+    BAD_CONDITIONS.append(condition)
+    if len(BAD_CONDITIONS) > MAX_BAD_CONDITIONS:
+        BAD_CONDITIONS.pop(0)
+
+
+def is_bad_condition(condition: dict) -> bool:
+    """Checks whether the currently analyzed setup matches a previously bad condition."""
+    for bad in BAD_CONDITIONS:
+        if bad.get("htf_bias") == condition.get("htf_bias") and abs(float(bad.get("rsi", 0)) - float(condition.get("rsi", 0))) < 8 and abs(float(bad.get("atr", 0)) - float(condition.get("atr", 0))) < 0.5:
+            return True
+    return False
+
+
 def calculate_m5_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Calculates smoothed M5 trend indicators (EMA 8/21, RSI-14, ATR-14)."""
     df['ema_fast'] = df['close'].ewm(span=8, adjust=False).mean()
@@ -229,6 +256,15 @@ def ask_ollama_model(df: pd.DataFrame, htf_bias: str) -> str:
         fallback_bias = "SELL"
     else:
         fallback_bias = "BUY" if (fast_above or rsi >= 50 or price_change > 0) else "SELL"
+
+    current_condition = {
+        "htf_bias": htf_bias,
+        "rsi": float(rsi),
+        "atr": float(latest['atr']),
+    }
+    if is_bad_condition(current_condition):
+        print(f"   [LEARNING] Blacklisted condition detected. Skipping trade for H1={htf_bias}, RSI={rsi:.1f}, ATR={latest['atr']:.2f}.")
+        return "SELL" if fallback_bias == "BUY" else "BUY"
 
     prompt = f"""
     You are an M5 Gold (XAUUSD) Trend Scalper.
@@ -405,6 +441,16 @@ def execute_order(symbol: str, action: str, lot_size: float = DEFAULT_LOT_SIZE) 
     }
     record_trade_outcome(action, 0.0, trade_result, trade_context)
     adapt_risk_after_trade()
+
+    if trade_result < 0:
+        add_bad_condition({
+            "htf_bias": trade_context["htf_bias"],
+            "rsi": float(df["rsi"].iloc[-1]),
+            "atr": float(latest_atr),
+        })
+        print(f"   [LEARNING] Logged loss condition: H1={trade_context['htf_bias']}, RSI={df['rsi'].iloc[-1]:.1f}, ATR={latest_atr:.2f}")
+
+    save_trade_history()
 
     return (f"Order Executed! Ticket: {result.order} | Price: {result.price} | "
             f"SL: {round(sl, digits)} (-${sl_distance:.2f}) | TP: {round(tp, digits)} (+${tp_distance:.2f}) | Profit: ${trade_result:.2f}")
