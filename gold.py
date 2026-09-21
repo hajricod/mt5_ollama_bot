@@ -39,6 +39,7 @@ MAX_TRADE_HISTORY = 200
 MAX_BAD_CONDITIONS = 25
 BASE_LOT_SIZE = DEFAULT_LOT_SIZE
 BASE_MAX_RISK_PERCENT = MAX_RISK_PERCENT
+HISTORY_PATH = "trade_history.json"
 
 
 def init_mt5() -> bool:
@@ -181,7 +182,37 @@ def adapt_risk_after_trade() -> None:
         MAX_RISK_PERCENT = min(BASE_MAX_RISK_PERCENT, max(MAX_RISK_PERCENT, BASE_MAX_RISK_PERCENT * 0.9))
 
 
-def save_trade_history(path: str = "trade_history.json") -> None:
+def load_trade_history(path: str = HISTORY_PATH) -> None:
+    """Loads past trades from disk so learning carries over between bot restarts."""
+    global TRADE_HISTORY
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            loaded = json.load(file)
+        if isinstance(loaded, list):
+            TRADE_HISTORY = loaded
+            print(f"   [LEARNING] Loaded {len(TRADE_HISTORY)} saved trades from {path}")
+    except FileNotFoundError:
+        print(f"   [LEARNING] No saved trade history found at {path}. Starting fresh.")
+    except Exception as e:
+        print(f"   [LEARNING] Failed to load trade history: {e}")
+
+
+def get_trade_summary(window: int = 20) -> dict:
+    """Builds a compact summary of recent performance for operator feedback."""
+    perf = get_recent_performance(window)
+    summary = {
+        "total_trades": len(TRADE_HISTORY),
+        "wins": sum(1 for trade in TRADE_HISTORY if float(trade.get("result_usd", 0)) > 0),
+        "losses": sum(1 for trade in TRADE_HISTORY if float(trade.get("result_usd", 0)) < 0),
+        "win_rate": perf["win_rate"],
+        "avg_result": perf["avg_result"],
+        "recent_window": window,
+    }
+    return summary
+
+
+def save_trade_history(path: str = HISTORY_PATH) -> None:
     """Persists recent trade history to disk for offline review and retraining."""
     try:
         with open(path, "w", encoding="utf-8") as file:
@@ -436,6 +467,7 @@ def execute_order(symbol: str, action: str, lot_size: float = DEFAULT_LOT_SIZE) 
         "sl_distance": sl_distance,
         "tp_distance": tp_distance,
         "spread": spread,
+        "rsi": float(df["rsi"].iloc[-1]),
         "atr": latest_atr,
         "htf_bias": get_h1_htf_bias(symbol),
     }
@@ -458,7 +490,10 @@ def execute_order(symbol: str, action: str, lot_size: float = DEFAULT_LOT_SIZE) 
 
 # --- CONTINUOUS 5-MINUTE AUTOMATED LOOP ---
 if __name__ == "__main__":
+    load_trade_history()
+    summary = get_trade_summary(20)
     print(f"Starting Continuous Structural M5 Gold Scalper ({SYMBOL}). Press Ctrl+C to exit.\n")
+    print(f"   [LEARNING SUMMARY] Total trades: {summary['total_trades']} | Wins: {summary['wins']} | Losses: {summary['losses']} | Win rate: {summary['win_rate']:.2%} | Avg result: ${summary['avg_result']:.2f}")
 
     while True:
         try:
