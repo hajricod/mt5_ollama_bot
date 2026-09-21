@@ -1,13 +1,14 @@
 import sys
 import time
 import json
+import datetime
 import requests
 import pandas as pd
 import MetaTrader5 as mt5
 
 # --- STRATEGY & INSTRUMENT CONFIGURATION ---
 SYMBOL = "XAUUSDm"
-TIMEFRAME = mt5.TIMEFRAME_M5      # Reverted to 5-Minute Timeframe
+TIMEFRAME = mt5.TIMEFRAME_M5      # 5-Minute Execution Timeframe
 LOOKBACK_BARS = 60                # Historical M5 bars for indicators
 MAGIC_NUMBER = 202611
 
@@ -15,15 +16,21 @@ MAGIC_NUMBER = 202611
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b"
 
-# --- REFINED M5 RISK MANAGEMENT PARAMETERS ---
-DEFAULT_LOT_SIZE = 0.01          # Base lot size
-MAX_RISK_PERCENT = 0.03          # Risk capped at 3% per trade
-MAX_SL_DIST_DOLLARS = 4.00       # Maximum Stop Loss cap ($4.00 on Gold)
-MIN_SL_DIST_DOLLARS = 1.50       # Minimum Stop Loss floor ($1.50)
-MAX_ALLOWED_SPREAD = 0.45        # Max spread tolerance ($0.45)
-ATR_SL_MULTIPLIER = 2.0          # SL multiplier (2.0x ATR for volatility buffer)
-RISK_REWARD_RATIO = 1.25         # TP multiplier (1:1.25 Risk-to-Reward)
-MAX_CONSECUTIVE_LOSSES = 100     # Loss streak safety limit
+# --- RISK MANAGEMENT & FILTER PARAMETERS ---
+DEFAULT_LOT_SIZE = 0.01           # Base lot size
+MAX_OPEN_POSITIONS = 5           # Max concurrent active positions
+MAX_RISK_PERCENT = 0.03          # Max account risk cap (3%)
+MAX_SL_DIST_DOLLARS = 4.00       # Maximum SL cap ($4.00)
+MIN_SL_DIST_DOLLARS = 1.50       # Minimum SL floor ($1.50)
+MAX_ALLOWED_SPREAD = 0.45        # Hard cap spread tolerance ($0.45)
+MIN_M5_ATR_DOLLARS = 1.00        # Minimum ATR to avoid low-volatility chop
+ATR_SL_MULTIPLIER = 2.0          # Dynamic ATR SL multiplier
+RISK_REWARD_RATIO = 1.25         # Target Risk-to-Reward ratio (1:1.25)
+MAX_CONSECUTIVE_LOSSES = 4       # Consecutive loss safety lock
+
+# --- SESSION TIMING (UTC) ---
+SESSION_START_HOUR_UTC = 7       # London Open (07:00 UTC)
+SESSION_END_HOUR_UTC = 20        # NY Session Mid-Close (20:00 UTC)
 
 
 def init_mt5() -> bool:
@@ -60,6 +67,22 @@ def normalize_lot(symbol_info, target_lot: float) -> float:
     return max(min_vol, min(lot, max_vol))
 
 
+def is_active_trading_session() -> bool:
+    """Restricts trading to London and New York high-liquidity sessions (07:00-20:00 UTC)."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc).time()
+    start_time = datetime.time(SESSION_START_HOUR_UTC, 0)
+    end_time = datetime.time(SESSION_END_HOUR_UTC, 0)
+    return start_time <= now_utc <= end_time
+
+
+def count_open_positions(symbol: str, magic: int) -> int:
+    """Counts active positions for the given symbol and magic number."""
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return 0
+    return sum(1 for pos in positions if pos.magic == magic)
+
+
 def check_consecutive_losses(symbol: str, limit: int = MAX_CONSECUTIVE_LOSSES) -> bool:
     """Checks trade history for recent consecutive losing trades."""
     now = time.time()
@@ -79,19 +102,35 @@ def check_consecutive_losses(symbol: str, limit: int = MAX_CONSECUTIVE_LOSSES) -
     return False
 
 
+def get_h1_htf_bias(symbol: str) -> str:
+    """Evaluates H1 Higher Timeframe trend via EMA 50 / 200 crossover."""
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 200)
+    if rates is None or len(rates) < 200:
+        print("[HTF WARNING] Could not fetch sufficient H1 candles. Allowing neutral bias.")
+        return "ANY"
+
+    df_h1 = pd.DataFrame(rates)
+    ema_50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+    ema_200 = df_h1['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+
+    if ema_50 > ema_200:
+        return "BUY_ONLY"
+    elif ema_50 < ema_200:
+        return "SELL_ONLY"
+    return "ANY"
+
+
 def calculate_m5_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates smoothed trend indicators (EMA 8/21, RSI-14, ATR-14) for M5 candles."""
+    """Calculates smoothed M5 trend indicators (EMA 8/21, RSI-14, ATR-14)."""
     df['ema_fast'] = df['close'].ewm(span=8, adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
 
-    # Standard RSI (14-period)
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # Standard Average True Range (14-period)
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -115,8 +154,8 @@ def get_market_data(symbol: str, count: int = LOOKBACK_BARS) -> pd.DataFrame | N
     return df[['time', 'open', 'high', 'low', 'close', 'tick_volume', 'ema_fast', 'ema_slow', 'rsi', 'atr']]
 
 
-def ask_ollama_model(df: pd.DataFrame) -> str:
-    """Forces Ollama to evaluate structured M5 momentum and choose BUY or SELL without HOLD."""
+def ask_ollama_model(df: pd.DataFrame, htf_bias: str) -> str:
+    """Forces Ollama to evaluate structured M5 momentum constrained by HTF bias."""
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -124,26 +163,29 @@ def ask_ollama_model(df: pd.DataFrame) -> str:
     rsi = latest['rsi']
     price_change = latest['close'] - prev['close']
 
-    # Determine baseline bias in Python
-    if fast_above or rsi >= 50 or price_change > 0:
+    # Baseline Python decision logic
+    if htf_bias == "BUY_ONLY":
         fallback_bias = "BUY"
-    else:
+    elif htf_bias == "SELL_ONLY":
         fallback_bias = "SELL"
+    else:
+        fallback_bias = "BUY" if (fast_above or rsi >= 50 or price_change > 0) else "SELL"
 
     prompt = f"""
-    You are an M5 Gold (XAUUSD) Trend-Following Scalper.
-    You MUST execute a trade on every cycle. HOLD IS NOT ALLOWED.
+    You are an M5 Gold (XAUUSD) Trend Scalper.
+    You MUST output either "BUY" or "SELL". HOLD IS NOT ALLOWED.
 
+    H1 Trend Context: {htf_bias}
     M5 Market Indicators:
     - EMA(8): {latest['ema_fast']:.2f}
     - EMA(21): {latest['ema_slow']:.2f}
     - RSI(14): {rsi:.1f}
     - ATR(14): {latest['atr']:.2f}
-    - Technical Trend Bias: {fallback_bias}
+    - Calculated Bias: {fallback_bias}
 
-    Execution Rules:
-    - Choose "BUY" if EMA(8) > EMA(21) or RSI >= 50
-    - Choose "SELL" if EMA(8) < EMA(21) or RSI < 50
+    Execution Constraint:
+    - If H1 Context is BUY_ONLY, choose "BUY" unless momentum is severely overbought.
+    - If H1 Context is SELL_ONLY, choose "SELL" unless momentum is severely oversold.
 
     Respond STRICTLY in JSON format:
     {{"reason": "short explanation", "decision": "BUY" | "SELL"}}
@@ -168,6 +210,15 @@ def ask_ollama_model(df: pd.DataFrame) -> str:
             decision = res_json.get('decision', '').strip().upper()
 
             print(f"   [AI Reasoning] {reason}")
+
+            # Enforce hard filter alignment with HTF
+            if htf_bias == "BUY_ONLY" and decision == "SELL":
+                print(f"   [HTF FILTER] Overriding SELL signal -> Forced BUY due to Bullish H1 Trend.")
+                return "BUY"
+            elif htf_bias == "SELL_ONLY" and decision == "BUY":
+                print(f"   [HTF FILTER] Overriding BUY signal -> Forced SELL due to Bearish H1 Trend.")
+                return "SELL"
+
             if decision in ["BUY", "SELL"]:
                 return decision
 
@@ -179,56 +230,71 @@ def ask_ollama_model(df: pd.DataFrame) -> str:
 
 
 def execute_order(symbol: str, action: str, lot_size: float = DEFAULT_LOT_SIZE) -> str:
-    """Executes market orders with M5 ATR risk parameters."""
+    """Executes market orders with structural safety and volatility filters."""
     if action.upper() not in ["BUY", "SELL"]:
         return f"Execution error: Invalid signal '{action}'."
 
     if not init_mt5():
         return "Trade aborted: MT5 Initialization failed."
 
-    # Guardrail 1: Loss Streak Check
+    # Guardrail 1: Active Open Positions Limit Check
+    open_positions = count_open_positions(symbol, MAGIC_NUMBER)
+    if open_positions >= MAX_OPEN_POSITIONS:
+        mt5.shutdown()
+        return f"[POSITION GUARD] Skipped: Active positions ({open_positions}) reached max limit ({MAX_OPEN_POSITIONS})."
+
+    # Guardrail 2: Loss Streak Check
     if check_consecutive_losses(symbol, MAX_CONSECUTIVE_LOSSES):
         mt5.shutdown()
         return f"[RISK GUARD] Blocked: Hit {MAX_CONSECUTIVE_LOSSES} consecutive losses."
 
-    # Guardrail 2: Account Budget Verification
-    account_info = mt5.account_info()
-    if not account_info:
+    # Guardrail 3: Session Time Check
+    if not is_active_trading_session():
         mt5.shutdown()
-        return "Failed to fetch account balance."
+        return "[TIME GUARD] Skipped: Current time outside active London/NY sessions (07:00-20:00 UTC)."
+
+    account_info = mt5.account_info()
+    symbol_info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+
+    if not account_info or not symbol_info or not tick:
+        mt5.shutdown()
+        return "Account or Symbol market context unavailable."
 
     balance = account_info.balance
     max_allowed_loss = balance * MAX_RISK_PERCENT
 
-    symbol_info = mt5.symbol_info(symbol)
-    tick = mt5.symbol_info_tick(symbol)
-
-    if not symbol_info or not tick:
-        mt5.shutdown()
-        return "Symbol or tick data unavailable."
-
-    # Guardrail 3: Spread Guardrail
+    # Guardrail 4: Spread Cap
     spread = tick.ask - tick.bid
     if spread > MAX_ALLOWED_SPREAD:
         mt5.shutdown()
-        return f"[SPREAD GUARD] Rejected: Current spread (${spread:.2f}) exceeds limit (${MAX_ALLOWED_SPREAD:.2f})."
+        return f"[SPREAD GUARD] Rejected: Current spread (${spread:.2f}) exceeds max allowed limit (${MAX_ALLOWED_SPREAD:.2f})."
 
-    # Fetch ATR data
+    # Fetch M5 ATR for Volatility Verification
     df = get_market_data(symbol, count=20)
     if df is None or df['atr'].dropna().empty:
         mt5.shutdown()
-        return "Trade aborted: Indicator data unavailable."
+        return "Trade aborted: Volatility indicators unavailable."
 
     latest_atr = df['atr'].iloc[-1]
-    raw_sl_distance = latest_atr * ATR_SL_MULTIPLIER
 
-    # Bound SL distance for M5 market noise
+    # Guardrail 5: Low-Volatility Chop & Relative Spread Guard
+    if latest_atr < MIN_M5_ATR_DOLLARS:
+        mt5.shutdown()
+        return f"[VOLATILITY GUARD] Skipped: Low ATR (${latest_atr:.2f}). Market in range chop."
+
+    if spread > (latest_atr * 0.15):
+        mt5.shutdown()
+        return f"[SPREAD GUARD] Rejected: Spread (${spread:.2f}) exceeds 15% of current M5 ATR (${latest_atr * 0.15:.2f})."
+
+    # Dynamic SL Calculation
+    raw_sl_distance = latest_atr * ATR_SL_MULTIPLIER
     sl_distance = min(max(raw_sl_distance, MIN_SL_DIST_DOLLARS), MAX_SL_DIST_DOLLARS)
 
     projected_loss = sl_distance * (lot_size / 0.01)
     if projected_loss > max_allowed_loss:
         mt5.shutdown()
-        return f"[RISK GUARD] Rejected: Risk (${projected_loss:.2f}) exceeds allowed limit (${max_allowed_loss:.2f})."
+        return f"[RISK GUARD] Rejected: Risk (${projected_loss:.2f}) exceeds limit (${max_allowed_loss:.2f})."
 
     tp_distance = sl_distance * RISK_REWARD_RATIO
     digits = symbol_info.digits
@@ -274,22 +340,23 @@ def execute_order(symbol: str, action: str, lot_size: float = DEFAULT_LOT_SIZE) 
 
 # --- CONTINUOUS 5-MINUTE AUTOMATED LOOP ---
 if __name__ == "__main__":
-    print(f"Starting Continuous M5 Trend Scalper ({SYMBOL}). Press Ctrl+C to exit.\n")
+    print(f"Starting Continuous Structural M5 Gold Scalper ({SYMBOL}). Press Ctrl+C to exit.\n")
 
     while True:
         try:
             if init_mt5():
+                htf_bias = get_h1_htf_bias(SYMBOL)
                 df_candles = get_market_data(SYMBOL, LOOKBACK_BARS)
                 mt5.shutdown()
 
                 if df_candles is not None:
                     current_time = df_candles.iloc[-1]['time']
-                    print(f"\n[{current_time}] Analyzing M5 Candle Data...")
+                    print(f"\n[{current_time}] Analyzing Market State | H1 Bias: {htf_bias}")
 
-                    decision = ask_ollama_model(df_candles)
+                    decision = ask_ollama_model(df_candles, htf_bias)
                     print(f"   [AI Decision] {decision}")
 
-                    print(f"   Executing {decision} order on MT5...")
+                    print(f"   Executing {decision} order sequence on MT5...")
                     status = execute_order(SYMBOL, decision, lot_size=DEFAULT_LOT_SIZE)
                     print(f"   [Execution Result] {status}")
 
