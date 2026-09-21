@@ -136,7 +136,7 @@ def record_trade_outcome(signal: str, result_pips: float, result_usd: float, con
         "result_pips": result_pips,
         "result_usd": result_usd,
         "context": context,
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     })
 
     if len(TRADE_HISTORY) > MAX_TRADE_HISTORY:
