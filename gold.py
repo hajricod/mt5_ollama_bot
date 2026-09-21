@@ -26,7 +26,7 @@ MAX_ALLOWED_SPREAD = 0.45        # Hard cap spread tolerance ($0.45)
 MIN_M5_ATR_DOLLARS = 1.00        # Minimum ATR to avoid low-volatility chop
 ATR_SL_MULTIPLIER = 2.0          # Dynamic ATR SL multiplier
 RISK_REWARD_RATIO = 1.25         # Target Risk-to-Reward ratio (1:1.25)
-MAX_CONSECUTIVE_LOSSES = 4       # Consecutive loss safety lock
+MAX_CONSECUTIVE_LOSSES = 100       # Consecutive loss safety lock
 
 # --- SESSION TIMING (UTC) ---
 SESSION_START_HOUR_UTC = 7       # London Open (07:00 UTC)

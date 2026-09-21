@@ -1,0 +1,17 @@
+[
+  {
+    "signal": "BUY",
+    "result_pips": 0.0,
+    "result_usd": 0.0,
+    "context": {
+      "action": "BUY",
+      "lot_size": 0.01,
+      "sl_distance": 4.0,
+      "tp_distance": 5.0,
+      "spread": 0.2600000000002183,
+      "atr": 2.898500000000045,
+      "htf_bias": "ANY"
+    },
+    "timestamp": "2026-09-21T18:47:19.351958"
+  }
+]
