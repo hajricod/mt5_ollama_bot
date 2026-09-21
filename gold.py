@@ -32,6 +32,12 @@ MAX_CONSECUTIVE_LOSSES = 4       # Consecutive loss safety lock
 SESSION_START_HOUR_UTC = 7       # London Open (07:00 UTC)
 SESSION_END_HOUR_UTC = 20        # NY Session Mid-Close (20:00 UTC)
 
+# --- LEARNING / ADAPTIVE RISK STATE ---
+TRADE_HISTORY = []
+MAX_TRADE_HISTORY = 200
+BASE_LOT_SIZE = DEFAULT_LOT_SIZE
+BASE_MAX_RISK_PERCENT = MAX_RISK_PERCENT
+
 
 def init_mt5() -> bool:
     """Initializes MetaTrader 5 connection and selects the symbol."""
@@ -118,6 +124,59 @@ def get_h1_htf_bias(symbol: str) -> str:
     elif ema_50 < ema_200:
         return "SELL_ONLY"
     return "ANY"
+
+
+def record_trade_outcome(signal: str, result_pips: float, result_usd: float, context: dict) -> None:
+    """Stores the most recent trade outcomes for performance-based learning."""
+    TRADE_HISTORY.append({
+        "signal": signal,
+        "result_pips": result_pips,
+        "result_usd": result_usd,
+        "context": context,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+    })
+
+    if len(TRADE_HISTORY) > MAX_TRADE_HISTORY:
+        TRADE_HISTORY.pop(0)
+
+
+def get_recent_performance(window: int = 20) -> dict:
+    """Returns rolling win rate and average return for recent trades."""
+    if len(TRADE_HISTORY) == 0:
+        return {"win_rate": 0.5, "avg_result": 0.0, "wins": 0, "losses": 0}
+
+    recent = TRADE_HISTORY[-window:]
+    wins = sum(1 for trade in recent if trade["result_usd"] > 0)
+    losses = sum(1 for trade in recent if trade["result_usd"] < 0)
+    avg_result = sum(trade["result_usd"] for trade in recent) / len(recent)
+
+    return {
+        "win_rate": wins / len(recent),
+        "avg_result": avg_result,
+        "wins": wins,
+        "losses": losses,
+    }
+
+
+def adapt_risk_after_trade() -> None:
+    """Adjusts risk based on recent performance to learn from losses."""
+    global DEFAULT_LOT_SIZE, MAX_RISK_PERCENT
+
+    perf = get_recent_performance(20)
+    recent_losses = perf["losses"]
+    recent_wins = perf["wins"]
+
+    if recent_losses >= 5 and perf["avg_result"] < 0:
+        DEFAULT_LOT_SIZE = max(0.01, DEFAULT_LOT_SIZE * 0.7)
+        MAX_RISK_PERCENT = max(0.01, MAX_RISK_PERCENT * 0.75)
+        print(f"   [LEARNING] Loss streak detected. Reduced lot size to {DEFAULT_LOT_SIZE} and risk to {MAX_RISK_PERCENT:.3f}.")
+    elif recent_wins >= 5 and perf["avg_result"] > 0 and perf["win_rate"] >= 0.6:
+        DEFAULT_LOT_SIZE = min(0.05, DEFAULT_LOT_SIZE * 1.1)
+        MAX_RISK_PERCENT = min(BASE_MAX_RISK_PERCENT, MAX_RISK_PERCENT * 1.05)
+        print(f"   [LEARNING] Recovery trend detected. Increased lot size to {DEFAULT_LOT_SIZE} and risk to {MAX_RISK_PERCENT:.3f}.")
+    else:
+        DEFAULT_LOT_SIZE = min(BASE_LOT_SIZE * 1.2, max(DEFAULT_LOT_SIZE, BASE_LOT_SIZE))
+        MAX_RISK_PERCENT = min(BASE_MAX_RISK_PERCENT, max(MAX_RISK_PERCENT, BASE_MAX_RISK_PERCENT * 0.9))
 
 
 def calculate_m5_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -334,8 +393,21 @@ def execute_order(symbol: str, action: str, lot_size: float = DEFAULT_LOT_SIZE) 
         comment = result.comment if result else "Null MT5 response"
         return f"Order Failed: {comment} (Code: {result.retcode if result else 'N/A'})"
 
+    trade_result = float(result.profit) if hasattr(result, 'profit') else 0.0
+    trade_context = {
+        "action": action,
+        "lot_size": lot_size,
+        "sl_distance": sl_distance,
+        "tp_distance": tp_distance,
+        "spread": spread,
+        "atr": latest_atr,
+        "htf_bias": get_h1_htf_bias(symbol),
+    }
+    record_trade_outcome(action, 0.0, trade_result, trade_context)
+    adapt_risk_after_trade()
+
     return (f"Order Executed! Ticket: {result.order} | Price: {result.price} | "
-            f"SL: {round(sl, digits)} (-${sl_distance:.2f}) | TP: {round(tp, digits)} (+${tp_distance:.2f})")
+            f"SL: {round(sl, digits)} (-${sl_distance:.2f}) | TP: {round(tp, digits)} (+${tp_distance:.2f}) | Profit: ${trade_result:.2f}")
 
 
 # --- CONTINUOUS 5-MINUTE AUTOMATED LOOP ---
